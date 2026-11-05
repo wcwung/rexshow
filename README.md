@@ -11,10 +11,9 @@ chat; `rexshow` gives them a pane beside theirs that does.
 - Watch a folder, and each new image or video shows by itself.
 
 rexshow got its idea from [rexpad](https://github.com/almonk/rexpad), which
-shows an agent's todo list in a Rex pane. Parts of the rexshow code come from
-rexpad: the Rex pane control, the skill install, the kitty graphics helpers,
-and the terminal setup of the viewer. rexpad is MIT licensed, copyright (c)
-2026 Alasdair Monk. See [NOTICE](NOTICE).
+shows an agent's todo list in a Rex pane. Much of the rexshow code starts from
+the rexpad code, with changes for images and video. rexpad is MIT licensed,
+copyright (c) 2026 Alasdair Monk.
 
 ## Install
 
