@@ -45,21 +45,7 @@ rexshow hide | list | clear | unwatch DIR
 Each Rex pane gets its own viewer (keyed by `$REX_BLOCK`). To share one viewer
 between several agents, pass the same `--list NAME` on every command.
 
-## Controls
-
-| Keys | Mouse or touch | Action |
-|---|---|---|
-| ← → | ◀ ▶ buttons | previous or next item |
-| g / G | tap a thumbnail | first or newest item, or that item |
-| + − | − + buttons, wheel | zoom (the wheel zooms toward the pointer) |
-| z | tap the image | zoom to 2× (a tap zooms at that point) |
-| 0 | fit button | back to the full image |
-| arrows, h j k l (zoomed) | tap the image (zoomed) | pan (a tap moves that point to the middle) |
-| space | ❚❚ ▶ button | pause or play a video |
-| , . | | step a video one frame |
-| q | | close |
-
-## The agent skill
+## The agent skill (recommended)
 
 `skills/rexshow/SKILL.md` tells an agent to watch the folder where it saves
 media, open the pane, add captions, and show results as soon as it has them.
@@ -83,10 +69,16 @@ make install SKILLS=$HOME/.codex/skills    # Codex
 
 `rexshow skill path --dir DIR` prints the path that `install` writes to.
 
-## How it works
+## Controls
 
-Images are decoded, scaled to at most 4096 px, compressed, and sent once.
-Zoom and pan only move the placement window over the sent image. `ffmpeg`
-decodes a video in the background to compressed frames, so a loop, a pause,
-or a step back needs no new decode. Playback takes its frame from the wall
-clock, so a slow link skips frames and does not play slow.
+| Keys | Mouse or touch | Action |
+|---|---|---|
+| ← → | ◀ ▶ buttons | previous or next item |
+| g / G | tap a thumbnail | first or newest item, or that item |
+| + − | − + buttons, wheel | zoom (the wheel zooms toward the pointer) |
+| z | tap the image | zoom to 2× (a tap zooms at that point) |
+| 0 | fit button | back to the full image |
+| arrows, h j k l (zoomed) | tap the image (zoomed) | pan (a tap moves that point to the middle) |
+| space | ❚❚ ▶ button | pause or play a video |
+| , . | | step a video one frame |
+| q | | close |
