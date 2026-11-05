@@ -47,25 +47,53 @@ func fit(w, h, maxW, maxH int) (int, int) {
 	return max(1, int(float64(w)*s+0.5)), max(1, int(float64(h)*s+0.5))
 }
 
-func loadImage(path string, maxW, maxH int) (encoded, error) {
+func decodeFile(path string) (image.Image, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return encoded{}, err
+		return nil, err
 	}
 	defer f.Close()
 	src, _, err := image.Decode(bufio.NewReader(f))
-	if err != nil {
-		return encoded{}, err
-	}
+	return src, err
+}
+
+func scaleTo(src image.Image, w, h int) encoded {
 	b := src.Bounds()
-	w, h := fit(b.Dx(), b.Dy(), maxW, maxH)
 	dst := image.NewNRGBA(image.Rect(0, 0, w, h))
 	scaler := draw.Scaler(draw.CatmullRom)
 	if b.Dx()*b.Dy() > 4_000_000 {
 		scaler = draw.ApproxBiLinear
 	}
 	scaler.Scale(dst, dst.Bounds(), src, b, draw.Src, nil)
-	return encodeRGBA(dst.Pix, w, h), nil
+	return encodeRGBA(dst.Pix, w, h)
+}
+
+func loadImage(path string, maxW, maxH int) (encoded, error) {
+	src, err := decodeFile(path)
+	if err != nil {
+		return encoded{}, err
+	}
+	b := src.Bounds()
+	w, h := fit(b.Dx(), b.Dy(), maxW, maxH)
+	return scaleTo(src, w, h), nil
+}
+
+// loadStill decodes path one time into the full image, up to maxW x maxH.
+// When the full image has more than four times the pixels of the view, it
+// also makes a copy at the view's size, which is much less data to send.
+// A smaller image gets no copy: scaled down, it compresses less well.
+func loadStill(path string, maxW, maxH, viewW, viewH int) (full, fitted encoded, err error) {
+	src, err := decodeFile(path)
+	if err != nil {
+		return encoded{}, encoded{}, err
+	}
+	b := src.Bounds()
+	w, h := fit(b.Dx(), b.Dy(), maxW, maxH)
+	full = scaleTo(src, w, h)
+	if fw, fh := fit(w, h, viewW, viewH); w*h > 4*fw*fh {
+		fitted = scaleTo(src, fw, fh)
+	}
+	return full, fitted, nil
 }
 
 type videoInfo struct {
@@ -155,12 +183,21 @@ func decodeClip(path string, maxW, maxH int, notify func()) (*clip, error) {
 	}
 	go func() {
 		frame := make([]byte, w*h*4)
+		prev := make([]byte, len(frame))
+		var last encoded
 		r := bufio.NewReaderSize(out, len(frame))
 		for {
 			if _, err := io.ReadFull(r, frame); err != nil {
 				break
 			}
-			e := encodeRGBA(frame, w, h)
+			// Screen recordings hold many frames with no change. Such a frame
+			// shares the data of the one before it, so the player sends it once.
+			e := last
+			if last.data == nil || !bytes.Equal(frame, prev) {
+				e = encodeRGBA(frame, w, h)
+				prev, frame = frame, prev
+				last = e
+			}
 			c.mu.Lock()
 			c.frames = append(c.frames, e)
 			first := len(c.frames) == 1

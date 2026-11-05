@@ -1,5 +1,7 @@
 # rexshow
 
+![rexshow in a Rex pane beside a coding agent](docs/screenshot.png)
+
 Show screenshots and screen recordings in a [Rex](https://superlogical.com) pane, drawn
 with the kitty graphics protocol. Coding agents cannot show images in their
 chat; `rexshow` gives them a pane beside theirs that does.

@@ -37,11 +37,22 @@ func (ws winSize) cell() (float64, float64) {
 // --- kitty graphics ---------------------------------------------------------
 
 const (
-	idStill  = 1
+	idStillA = 1
 	idFrameA = 2
 	idFrameB = 3
+	idStillB = 4
+	idMarker = 5
 	idThumb0 = 10
 )
+
+// Placement IDs in the main view. A thumbnail can show there as a stand-in
+// while the full image decodes, beside its own placement in the strip.
+const (
+	pidMain   = 1
+	pidPoster = 2
+)
+
+type placement struct{ id, pid int }
 
 func kittyUpload(w *bufio.Writer, e encoded, id int) {
 	data := base64.StdEncoding.EncodeToString(e.data)
@@ -66,14 +77,17 @@ func kittyPlace(w *bufio.Writer, id int, b box) {
 	fmt.Fprintf(w, "\x1b7\x1b[%d;%dH\x1b_Ga=p,i=%d,p=1,c=%d,r=%d,C=1,q=2\x1b\\\x1b8", b.row, b.col, id, b.cols, b.rows)
 }
 
-func kittyDelete(w *bufio.Writer, id int) {
-	fmt.Fprintf(w, "\x1b_Ga=d,d=I,i=%d,q=2\x1b\\", id)
+// kittyUnplace removes one placement and keeps the image data, so the image
+// can show again with no new upload.
+func kittyUnplace(w *bufio.Writer, p placement) {
+	fmt.Fprintf(w, "\x1b_Ga=d,d=i,i=%d,p=%d,q=2\x1b\\", p.id, p.pid)
 }
 
-// kittyPlaceRect shows the src rectangle of image id over the cells of b.
-func kittyPlaceRect(w *bufio.Writer, id int, b box, src rect) {
-	fmt.Fprintf(w, "\x1b7\x1b[%d;%dH\x1b_Ga=p,i=%d,p=1,x=%d,y=%d,w=%d,h=%d,c=%d,r=%d,C=1,q=2\x1b\\\x1b8",
-		b.row, b.col, id, src.x, src.y, src.w, src.h, b.cols, b.rows)
+// kittyPlaceRect shows the src rectangle of an image over the cells of b. A
+// second call with the same placement moves it.
+func kittyPlaceRect(w *bufio.Writer, p placement, b box, src rect) {
+	fmt.Fprintf(w, "\x1b7\x1b[%d;%dH\x1b_Ga=p,i=%d,p=%d,x=%d,y=%d,w=%d,h=%d,c=%d,r=%d,C=1,q=2\x1b\\\x1b8",
+		b.row, b.col, p.id, p.pid, src.x, src.y, src.w, src.h, b.cols, b.rows)
 }
 
 // box is a rectangle of cells, 1-based.
@@ -169,7 +183,50 @@ const (
 	stillMax  = 4096
 	videoMaxW = 960
 	videoMaxH = 720
+	// Decoded stills kept for a fast step back, and clips kept so a return
+	// to a video does not decode it again.
+	stillCacheSize = 6
+	clipCacheSize  = 2
+
+	// The bar under the selected thumbnail, as fractions of a cell's height.
+	markerGap       = 0.22
+	markerThickness = 0.16
 )
+
+// defaultAccent is the blue of Rex's dark theme, used until the terminal
+// answers the query for palette color 4, the theme's accent.
+var defaultAccent = [3]uint8{84, 136, 238}
+
+func queryAccent(w *bufio.Writer) { fmt.Fprint(w, "\x1b]4;4;?\x07") }
+
+// parseAccent reads a reply like "4;4;rgb:5454/8888/eeee".
+func parseAccent(reply string) ([3]uint8, bool) {
+	spec, ok := strings.CutPrefix(reply, "4;4;rgb:")
+	if !ok {
+		return [3]uint8{}, false
+	}
+	parts := strings.Split(spec, "/")
+	if len(parts) != 3 {
+		return [3]uint8{}, false
+	}
+	var out [3]uint8
+	for i, p := range parts {
+		v, err := strconv.ParseUint(p, 16, 32)
+		if err != nil || len(p) == 0 || len(p) > 4 {
+			return [3]uint8{}, false
+		}
+		out[i] = uint8(float64(v)/float64(uint64(1)<<(4*len(p))-1)*255 + 0.5)
+	}
+	return out, true
+}
+
+func solid(c [3]uint8, w, h int) encoded {
+	pix := make([]byte, w*h*4)
+	for i := 0; i < len(pix); i += 4 {
+		pix[i], pix[i+1], pix[i+2], pix[i+3] = c[0], c[1], c[2], 255
+	}
+	return encodeRGBA(pix, w, h)
+}
 
 func makeLayout(ws winSize) layout {
 	l := layout{ws: ws, footerRow: ws.rows}
@@ -177,13 +234,21 @@ func makeLayout(ws winSize) layout {
 	if ws.rows >= 16 && ws.cols >= 24 {
 		cw, ch := ws.cell()
 		thumbCols := max(4, int(float64(thumbRows)*ch*16/10/cw+0.5))
-		count := max(1, (ws.cols+1)/(thumbCols+1))
-		used := count*(thumbCols+1) - 1
-		left := 1 + (ws.cols-used)/2
+		// One column of padding on each side lines the strip up with the
+		// footer buttons.
+		avail := ws.cols - 2
+		count := max(1, (avail+1)/(thumbCols+1))
+		width, extra := (avail-(count-1))/count, (avail-(count-1))%count
 		l.markerRow = ws.rows - 1
 		top := l.markerRow - thumbRows
+		col := 2
 		for i := range count {
-			l.thumbs = append(l.thumbs, box{top, left + i*(thumbCols+1), thumbRows, thumbCols})
+			cols := width
+			if i < extra {
+				cols++
+			}
+			l.thumbs = append(l.thumbs, box{top, col, thumbRows, cols})
+			col += cols + 1
 		}
 		bottom = top - 2
 	}
@@ -216,12 +281,14 @@ const (
 	keyWheelOut
 	keyTap
 	keyQuit
+	keyColor // a terminal reply to a color query, in input.reply
 )
 
 // input is a key press, or a wheel tick at a cell.
 type input struct {
 	key      key
 	row, col int
+	reply    string
 }
 
 func readKeys(keys chan<- input) {
@@ -243,6 +310,21 @@ func decodeKeys(b []byte) []input {
 	add := func(k key) { out = append(out, input{key: k}) }
 	for i := 0; i < len(b); i++ {
 		c := b[i]
+		if c == 0x1b && i+1 < len(b) && b[i+1] == ']' {
+			j := i + 2
+			for j < len(b) && b[j] != 0x07 && b[j] != 0x1b {
+				j++
+			}
+			if j >= len(b) {
+				break
+			}
+			out = append(out, input{key: keyColor, reply: string(b[i+2 : j])})
+			i = j
+			if b[j] == 0x1b {
+				i++
+			}
+			continue
+		}
 		if c == 0x1b && i+2 < len(b) && (b[i+1] == '[' || b[i+1] == 'O') {
 			j := i + 2
 			for j < len(b) && (b[j] < 0x40 || b[j] > 0x7e) {
@@ -254,7 +336,7 @@ func decodeKeys(b []byte) []input {
 			seq := string(b[i+2 : j+1])
 			if wheel, row, col, ok := parseWheel(seq); ok {
 				if wheel != keyNone {
-					out = append(out, input{wheel, row, col})
+					out = append(out, input{key: wheel, row: row, col: col})
 				}
 				i = j
 				continue
@@ -368,6 +450,12 @@ type thumbResult struct {
 	err error
 }
 
+type stillResult struct {
+	key       string
+	full, fit encoded
+	err       error
+}
+
 func thumbKey(path string, maxW, maxH int) string { return fmt.Sprintf("%s@%dx%d", path, maxW, maxH) }
 
 func runView(name string) error {
@@ -414,31 +502,55 @@ func runView(name string) error {
 		}
 	}()
 	defer close(jobs)
+	stillResults := make(chan stillResult, 16)
 
 	var (
-		show       = &Show{}
-		entries    []Entry
-		idx        = -1
-		follow     = true
-		ws         = getWinSize(in)
-		lay        = makeLayout(ws)
-		thumbs     = map[string]encoded{}
-		pending    = map[string]bool{}
-		stillPath  string
-		still      encoded
-		stillErr   error
+		show    = &Show{}
+		entries []Entry
+		idx     = -1
+		follow  = true
+		ws      = getWinSize(in)
+		lay     = makeLayout(ws)
+
+		thumbs      = map[string]encoded{}
+		pending     = map[string]bool{}
+		thumbIDs    = map[string]int{} // thumbnails the terminal holds
+		nextThumbID = idThumb0
+		slotKeys    []string // the thumbnail each strip slot shows
+
+		stills       = map[string]stillResult{}
+		stillOrder   []string
+		stillPending = map[string]bool{}
+		stillHeld    = map[int]string{} // the still each still ID holds
+		stillPath    string
+		stillKeyNow  string
+		still        encoded // the full image
+		stillFit     encoded // a copy at the view's size, for a very large image
+		stillErr     error
+
+		mainAt placement // what the main view shows now
+
+		accent    = defaultAccent
+		markerKey string // the size and color of the marker image the terminal holds
+		markerOn  bool
+		lastQuery time.Time
+
+		clips      = map[string]*clip{}
+		clipOrder  []string
 		cur        *clip
 		playing    = true
 		frameIdx   = 0
 		frameID    = idFrameA
 		shownFrame = -1
+		shownData  []byte    // the frame data the terminal shows now
 		playFrom   time.Time // when playback reached playBase
 		playBase   int
-		lastStamp  time.Time
-		lastScan   time.Time
-		signature  string
-		zm         = zoom{1, 0.5, 0.5}
-		buttons    []button
+
+		lastStamp time.Time
+		lastScan  time.Time
+		signature string
+		zm        = zoom{1, 0.5, 0.5}
+		buttons   []button
 	)
 
 	reload := func() bool {
@@ -481,44 +593,112 @@ func runView(name string) error {
 		return true
 	}
 
-	stopClip := func() {
-		if cur != nil {
-			cur.stop()
-			cur = nil
+	mainPixels := func() (int, int) {
+		cw, ch := ws.cell()
+		return int(float64(lay.main.cols) * cw), int(float64(lay.main.rows) * ch)
+	}
+	stillKey := func(path string) string {
+		mw, mh := mainPixels()
+		return fmt.Sprintf("%s@%dx%d", path, mw, mh)
+	}
+	requestStill := func(path string) {
+		k := stillKey(path)
+		if _, ok := stills[k]; ok || stillPending[k] {
+			return
 		}
-		shownFrame = -1
+		stillPending[k] = true
+		mw, mh := mainPixels()
+		go func() {
+			full, fitted, err := loadStill(path, max(mw, stillMax), max(mh, stillMax), mw, mh)
+			stillResults <- stillResult{k, full, fitted, err}
+		}()
+	}
+	cacheStill := func(r stillResult) {
+		delete(stillPending, r.key)
+		if _, ok := stills[r.key]; !ok {
+			stillOrder = append(stillOrder, r.key)
+		}
+		stills[r.key] = r
+		for len(stillOrder) > stillCacheSize {
+			i := 0
+			if stillOrder[0] == stillKeyNow {
+				i = 1
+			}
+			delete(stills, stillOrder[i])
+			stillOrder = append(stillOrder[:i], stillOrder[i+1:]...)
+		}
+	}
+	prefetch := func() {
+		n := len(entries)
+		if n == 0 || idx < 0 {
+			return
+		}
+		for _, i := range []int{(idx + 1) % n, (idx - 1 + n) % n} {
+			if entries[i].Kind != kindVideo {
+				requestStill(entries[i].Path)
+			}
+		}
 	}
 
-	// load prepares the current entry: a scaled still, or a clip decoding in
-	// the background.
+	openClip := func(path string) (*clip, error) {
+		if c, ok := clips[path]; ok {
+			for i, p := range clipOrder {
+				if p == path {
+					clipOrder = append(clipOrder[:i], clipOrder[i+1:]...)
+					break
+				}
+			}
+			clipOrder = append(clipOrder, path)
+			return c, nil
+		}
+		mw, mh := mainPixels()
+		c, err := decodeClip(path, min(mw, videoMaxW), min(mh, videoMaxH), notify)
+		if err != nil {
+			return nil, err
+		}
+		clips[path] = c
+		clipOrder = append(clipOrder, path)
+		for len(clipOrder) > clipCacheSize {
+			clips[clipOrder[0]].stop()
+			delete(clips, clipOrder[0])
+			clipOrder = clipOrder[1:]
+		}
+		return c, nil
+	}
+	dropClips := func() {
+		for _, c := range clips {
+			c.stop()
+		}
+		clips, clipOrder, cur, shownFrame = map[string]*clip{}, nil, nil, -1
+	}
+
+	// load prepares the current entry: a still from the cache or a decode in
+	// the background, or a clip.
 	load := func() {
+		stillPath, stillKeyNow, still, stillFit, stillErr = "", "", encoded{}, encoded{}, nil
 		if idx < 0 {
-			stopClip()
-			stillPath = ""
+			cur = nil
 			return
 		}
 		e := entries[idx]
-		cw, ch := ws.cell()
-		maxW, maxH := int(float64(lay.main.cols)*cw), int(float64(lay.main.rows)*ch)
 		if e.Kind == kindVideo {
-			if cur != nil && cur.path == e.Path {
-				return
+			if cur == nil || cur.path != e.Path {
+				shownFrame = -1
+				frameIdx, playing = 0, true
+				playFrom, playBase = time.Now(), 0
+				cur, stillErr = openClip(e.Path)
 			}
-			stopClip()
-			stillPath = ""
-			frameIdx, playing = 0, true
-			playFrom, playBase = time.Now(), 0
-			// The terminal scales frames up to the pane; smaller frames keep
-			// playback smooth over a slow link.
-			cur, stillErr = decodeClip(e.Path, min(maxW, videoMaxW), min(maxH, videoMaxH), notify)
+			prefetch()
 			return
 		}
-		stopClip()
-		if stillPath == e.Path {
-			return
+		cur, shownFrame = nil, -1
+		stillPath, stillKeyNow = e.Path, stillKey(e.Path)
+		if r, ok := stills[stillKeyNow]; ok {
+			still, stillFit, stillErr = r.full, r.fit, r.err
+		} else {
+			requestStill(e.Path)
 		}
-		stillPath = e.Path
-		still, stillErr = loadImage(e.Path, max(maxW, stillMax), max(maxH, stillMax))
+		prefetch()
 	}
 
 	text := func(row, col int, style, s string, maxCols int) {
@@ -531,13 +711,14 @@ func runView(name string) error {
 		}
 		fmt.Fprintf(w, "\x1b[%d;%dH%s%s\x1b[0m", row, col, style, string(r))
 	}
+	clearRow := func(row int) { fmt.Fprintf(w, "\x1b[%d;1H\x1b[2K", row) }
 	clock := func(sec float64) string {
 		s := int(sec)
 		return fmt.Sprintf("%d:%02d", s/60, s%60)
 	}
 
 	drawFooter := func() {
-		fmt.Fprintf(w, "\x1b[%d;1H\x1b[2K", lay.footerRow)
+		clearRow(lay.footerRow)
 		buttons = buttons[:0]
 		if idx < 0 {
 			return
@@ -594,6 +775,22 @@ func runView(name string) error {
 		}
 	}
 
+	// The new main image is placed before the old one goes, so the view never
+	// shows an empty frame between the two.
+	putMain := func(p placement, b box, src rect) {
+		kittyPlaceRect(w, p, b, src)
+		if mainAt.id != 0 && mainAt != p {
+			kittyUnplace(w, mainAt)
+		}
+		mainAt = p
+	}
+	clearMain := func() {
+		if mainAt.id != 0 {
+			kittyUnplace(w, mainAt)
+			mainAt = placement{}
+		}
+	}
+
 	drawFrame := func() {
 		if cur == nil {
 			return
@@ -614,13 +811,17 @@ func runView(name string) error {
 		if frameIdx == shownFrame {
 			return
 		}
+		if mainAt.id == frameID && len(shownData) > 0 && &img.data[0] == &shownData[0] {
+			shownFrame = frameIdx
+			drawFooter()
+			return
+		}
 		next := idFrameA + idFrameB - frameID
 		kittyUpload(w, img, next)
 		b, src := zm.view(lay.main, img.w, img.h, ws)
-		kittyPlaceRect(w, next, b, src)
-		kittyDelete(w, frameID)
+		putMain(placement{next, pidMain}, b, src)
 		frameID = next
-		shownFrame = frameIdx
+		shownFrame, shownData = frameIdx, img.data
 		drawFooter()
 	}
 
@@ -628,17 +829,72 @@ func runView(name string) error {
 		count := len(lay.thumbs)
 		return max(0, min(idx-count/2, len(entries)-count))
 	}
+	stripKey := func(path string) string {
+		if len(lay.thumbs) == 0 {
+			return ""
+		}
+		cw, ch := ws.cell()
+		b := lay.thumbs[0]
+		return thumbKey(path, int(float64(b.cols)*cw), int(float64(b.rows)*ch))
+	}
+	// heldThumb uploads a ready thumbnail once and returns its image ID, or 0.
+	heldThumb := func(k string) int {
+		if id, ok := thumbIDs[k]; ok {
+			return id
+		}
+		img := thumbs[k]
+		if img.w == 0 {
+			return 0
+		}
+		id := nextThumbID
+		nextThumbID++
+		kittyUpload(w, img, id)
+		thumbIDs[k] = id
+		return id
+	}
 
-	drawStrip := func() {
-		if len(lay.thumbs) == 0 || len(entries) == 0 {
+	// drawMarker puts a bar of the accent color under the selected thumbnail,
+	// as an image so its height and its gap are exact pixels.
+	drawMarker := func() {
+		slot := idx - stripStart()
+		if idx < 0 || slot < 0 || slot >= len(lay.thumbs) {
+			if markerOn {
+				kittyUnplace(w, placement{idMarker, pidMain})
+				markerOn = false
+			}
 			return
+		}
+		b := lay.thumbs[slot]
+		if img := thumbs[stripKey(entries[idx].Path)]; img.w > 0 {
+			b = place(b, img.w, img.h, ws)
+		}
+		cw, ch := ws.cell()
+		pw, ph := max(1, int(float64(b.cols)*cw)), max(2, int(ch*markerThickness+0.5))
+		k := fmt.Sprint(pw, ph, accent)
+		if k != markerKey {
+			kittyUpload(w, solid(accent, pw, ph), idMarker)
+			markerKey = k
+		}
+		fmt.Fprintf(w, "\x1b7\x1b[%d;%dH\x1b_Ga=p,i=%d,p=%d,Y=%d,C=1,q=2\x1b\\\x1b8",
+			lay.markerRow, b.col, idMarker, pidMain, int(ch*markerGap))
+		markerOn = true
+	}
+
+	// drawStrip only places the slots that changed, so a step to the next
+	// item does not send the thumbnails again.
+	drawStrip := func() {
+		if len(lay.thumbs) == 0 {
+			return
+		}
+		if len(slotKeys) != len(lay.thumbs) {
+			slotKeys = make([]string, len(lay.thumbs))
 		}
 		cw, ch := ws.cell()
 		start := stripStart()
+		next := make([]string, len(lay.thumbs))
+		inUse := map[string]bool{}
 		for slot, b := range lay.thumbs {
 			i := start + slot
-			id := idThumb0 + slot
-			kittyDelete(w, id)
 			fmt.Fprintf(w, "\x1b[%d;%dH%s", lay.markerRow, b.col, strings.Repeat(" ", b.cols))
 			if i >= len(entries) {
 				continue
@@ -647,25 +903,110 @@ func runView(name string) error {
 			maxW, maxH := int(float64(b.cols)*cw), int(float64(b.rows)*ch)
 			k := thumbKey(e.Path, maxW, maxH)
 			if img, ok := thumbs[k]; ok && img.w > 0 {
-				kittyUpload(w, img, id)
-				kittyPlace(w, id, place(b, img.w, img.h, ws))
+				next[slot] = k
+				inUse[k] = true
 			} else if !ok && !pending[k] {
 				pending[k] = true
 				jobs <- thumbJob{e.Path, e.Kind, maxW, maxH}
 			}
 			switch {
 			case i == idx:
-				fmt.Fprintf(w, "\x1b[%d;%dH\x1b[34m%s\x1b[0m", lay.markerRow, b.col, strings.Repeat("━", b.cols))
 			case e.Kind == kindVideo:
 				fmt.Fprintf(w, "\x1b[%d;%dH\x1b[2m▶ video\x1b[0m", lay.markerRow, b.col)
 			}
 		}
+		for slot, k := range next {
+			if k == "" || k == slotKeys[slot] {
+				continue
+			}
+			img := thumbs[k]
+			kittyPlaceRect(w, placement{heldThumb(k), pidMain}, place(lay.thumbs[slot], img.w, img.h, ws), rect{0, 0, img.w, img.h})
+		}
+		for _, k := range slotKeys {
+			if k != "" && !inUse[k] {
+				kittyUnplace(w, placement{thumbIDs[k], pidMain})
+			}
+		}
+		slotKeys = next
+		drawMarker()
+	}
+
+	// drawMain shows the current item: the still or the video frame, or its
+	// thumbnail stretched over the view until the full image is ready.
+	drawMain := func() {
+		msgRow := lay.main.row + lay.main.rows/2
+		clearRow(msgRow)
+		if idx < 0 {
+			clearMain()
+			return
+		}
+		poster := func(msg string) {
+			k := stripKey(entries[idx].Path)
+			if id := heldThumb(k); id != 0 {
+				img := thumbs[k]
+				b, src := zoom{1, 0.5, 0.5}.view(lay.main, img.w, img.h, ws)
+				putMain(placement{id, pidPoster}, b, src)
+				return
+			}
+			clearMain()
+			text(msgRow, 2, "\x1b[2m", msg, ws.cols-2)
+		}
+		switch {
+		case stillErr != nil:
+			clearMain()
+			text(msgRow, 2, "\x1b[31m", stillErr.Error(), ws.cols-2)
+		case cur != nil:
+			if _, n, done := cur.frame(0); n == 0 {
+				if done && cur.err != nil {
+					clearMain()
+					text(msgRow, 2, "\x1b[31m", cur.err.Error(), ws.cols-2)
+				} else {
+					poster("Decoding…")
+				}
+				return
+			}
+			shownFrame, shownData = -1, nil
+			drawFrame()
+		case still.w > 0:
+			img, version := still, stillKeyNow+"#full"
+			if zm.level <= 1 && stillFit.w > 0 {
+				img, version = stillFit, stillKeyNow+"#fit"
+			}
+			id := 0
+			for held, k := range stillHeld {
+				if k == version {
+					id = held
+				}
+			}
+			if id == 0 {
+				id = idStillA
+				if mainAt.id == idStillA {
+					id = idStillB
+				}
+				kittyUpload(w, img, id)
+				stillHeld[id] = version
+			}
+			b, src := zm.view(lay.main, img.w, img.h, ws)
+			putMain(placement{id, pidMain}, b, src)
+		default:
+			poster("Loading…")
+		}
+	}
+	waiting := func() bool {
+		if cur != nil {
+			_, n, _ := cur.frame(0)
+			return n == 0
+		}
+		return stillKeyNow != "" && still.w == 0 && stillErr == nil
 	}
 
 	draw := func() {
-		fmt.Fprint(w, "\x1b_Ga=d,d=A,q=2\x1b\\\x1b[H\x1b[2J")
-		shownFrame = -1
+		clearRow(1)
+		clearRow(2)
 		if idx < 0 {
+			drawMain()
+			drawStrip()
+			drawFooter()
 			msg := "Waiting for screenshots and recordings…"
 			text(ws.rows/2, max(1, (ws.cols-len([]rune(msg)))/2), "\x1b[2m", msg, ws.cols)
 			w.Flush()
@@ -678,28 +1019,22 @@ func runView(name string) error {
 		if e.Caption != "" {
 			text(2, 2, "\x1b[2m", e.Caption, ws.cols-2)
 		}
-		switch {
-		case stillErr != nil:
-			text(lay.main.row+lay.main.rows/2, 2, "\x1b[31m", stillErr.Error(), ws.cols-2)
-		case cur != nil:
-			if _, n, done := cur.frame(0); n == 0 {
-				msg := "Decoding…"
-				if done && cur.err != nil {
-					msg = cur.err.Error()
-				}
-				text(lay.main.row+lay.main.rows/2, 2, "\x1b[2m", msg, ws.cols-2)
-			}
-			drawFrame()
-		case still.w > 0:
-			kittyUpload(w, still, idStill)
-			b, src := zm.view(lay.main, still.w, still.h, ws)
-			kittyPlaceRect(w, idStill, b, src)
-		}
+		drawMain()
 		drawStrip()
 		drawFooter()
 		w.Flush()
 	}
 
+	// reset forgets every image the terminal holds, for a new pane size.
+	reset := func() {
+		fmt.Fprint(w, "\x1b_Ga=d,d=A,q=2\x1b\\\x1b[H\x1b[2J")
+		mainAt, slotKeys, nextThumbID = placement{}, nil, idThumb0
+		markerKey, markerOn = "", false
+		thumbIDs, stillHeld = map[string]int{}, map[int]string{}
+		dropClips()
+	}
+
+	queryAccent(w)
 	reload()
 	load()
 	draw()
@@ -709,32 +1044,49 @@ func runView(name string) error {
 	for {
 		select {
 		case <-quit:
-			stopClip()
+			dropClips()
 			return nil
 		case <-winch:
 			ws = getWinSize(in)
 			lay = makeLayout(ws)
-			stillPath = ""
-			stopClip()
+			reset()
 			load()
 			draw()
 		case r := <-results:
 			delete(pending, r.key)
 			thumbs[r.key] = r.img
 			drawStrip()
+			if waiting() {
+				drawMain()
+			}
 			w.Flush()
+		case r := <-stillResults:
+			cacheStill(r)
+			if r.key == stillKeyNow {
+				still, stillFit, stillErr = r.full, r.fit, r.err
+				drawMain()
+				drawFooter()
+				w.Flush()
+			}
 		case <-wake:
 			if cur != nil {
 				if _, n, done := cur.frame(0); n <= 1 || done {
-					draw()
-				} else {
-					drawFooter()
-					w.Flush()
+					drawMain()
 				}
+				drawFooter()
+				w.Flush()
 			}
 		case in, open := <-keys:
+			if open && in.key == keyColor {
+				if c, ok := parseAccent(in.reply); ok && c != accent {
+					accent = c
+					drawMarker()
+					w.Flush()
+				}
+				continue
+			}
 			if !open || in.key == keyQuit {
-				stopClip()
+				dropClips()
 				return nil
 			}
 			// mediaSize is the size of what the main view shows, in pixels.
@@ -797,9 +1149,13 @@ func runView(name string) error {
 			}
 			switch k {
 			case keyPrev:
-				idx = max(0, idx-1)
+				if n := len(entries); n > 0 {
+					idx = (idx - 1 + n) % n
+				}
 			case keyNext:
-				idx = min(len(entries)-1, idx+1)
+				if n := len(entries); n > 0 {
+					idx = (idx + 1) % n
+				}
 			case keyFirst:
 				idx = min(0, len(entries)-1)
 			case keyLast:
@@ -851,14 +1207,8 @@ func runView(name string) error {
 				zm = zoom{1, 0.5, 0.5}
 				load()
 				draw()
-			case zm != beforeZoom && cur != nil:
-				shownFrame = -1
-				drawFrame()
-				drawFooter()
-				w.Flush()
 			case zm != beforeZoom:
-				b, src := zm.view(lay.main, mw, mh, ws)
-				kittyPlaceRect(w, idStill, b, src)
+				drawMain()
 				drawFooter()
 				w.Flush()
 			default:
@@ -867,6 +1217,12 @@ func runView(name string) error {
 				w.Flush()
 			}
 		case now := <-tick.C:
+			// Rex sends no report when its theme changes, so ask again now and then.
+			if now.Sub(lastQuery) > time.Second {
+				lastQuery = now
+				queryAccent(w)
+				w.Flush()
+			}
 			if now.Sub(lastScan) > 700*time.Millisecond && reload() {
 				if idx < 0 || (entries[idx].Path != stillPath && (cur == nil || cur.path != entries[idx].Path)) {
 					zm = zoom{1, 0.5, 0.5}
