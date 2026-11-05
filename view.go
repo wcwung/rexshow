@@ -726,11 +726,11 @@ func runView(name string) error {
 		labels := []button{{label: "◀", key: keyPrev}, {label: "▶", key: keyNext},
 			{label: "−", key: keyZoomOut}, {label: "+", key: keyZoomIn}, {label: "fit", key: keyZoomReset}}
 		if cur != nil {
-			play := "❚❚"
+			play := "pause"
 			if !playing {
-				play = "▶"
+				play = "play "
 			}
-			labels = append(labels, button{label: play + " ", key: keyPlay})
+			labels = append(labels, button{label: play, key: keyPlay})
 		}
 		col := 2
 		for _, b := range labels {

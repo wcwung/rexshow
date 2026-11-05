@@ -79,6 +79,6 @@ make install SKILLS=$HOME/.codex/skills    # Codex
 | z | tap the image | zoom to 2× (a tap zooms at that point) |
 | 0 | fit button | back to the full image |
 | arrows, h j k l (zoomed) | tap the image (zoomed) | pan (a tap moves that point to the middle) |
-| space | ❚❚ ▶ button | pause or play a video |
+| space | pause / play button | pause or play a video |
 | , . | | step a video one frame |
 | q | | close |
