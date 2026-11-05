@@ -10,6 +10,9 @@ chat; `rexshow` gives them a pane beside theirs that does.
 - Works with Rex on iOS, which sends taps only: every control is a button.
 - Watch a folder, and each new image or video shows by itself.
 
+rexshow got its idea from [rexpad](https://github.com/almonk/rexpad), which
+shows an agent's todo list in a Rex pane.
+
 ## Install
 
 Needs Go 1.27 or later, and `ffmpeg` and `ffprobe` for video.
@@ -17,7 +20,7 @@ Needs Go 1.27 or later, and `ffmpeg` and `ffprobe` for video.
 ```bash
 git clone https://github.com/wcwung/rexshow
 cd rexshow
-make install    # builds ~/.local/bin/rexshow and links the skill into ~/.claude/skills
+make install    # builds ~/.local/bin/rexshow and links the skill into ~/.agents/skills
 ```
 
 Or, without the clone:
@@ -57,8 +60,25 @@ between several agents, pass the same `--list NAME` on every command.
 
 `skills/rexshow/SKILL.md` tells an agent to watch the folder where it saves
 media, open the pane, add captions, and show results as soon as it has them.
-`rexshow skill show` prints it; `rexshow skill install` writes it to
-`~/.claude/skills/rexshow`.
+`rexshow skill show` prints it.
+
+`rexshow skill install` writes the skill to `~/.agents/skills/rexshow/SKILL.md`
+by default. To write it to the skills folder of a different agent, use `--dir`:
+
+```bash
+rexshow skill install --dir ~/.claude/skills   # Claude Code
+rexshow skill install --dir ~/.codex/skills    # Codex
+```
+
+`make install` links the skill folder instead of a copy, so the installed skill
+follows edits in the clone. Set `SKILLS` to change the folder:
+
+```bash
+make install SKILLS=$HOME/.claude/skills   # Claude Code
+make install SKILLS=$HOME/.codex/skills    # Codex
+```
+
+`rexshow skill path --dir DIR` prints the path that `install` writes to.
 
 ## How it works
 

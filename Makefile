@@ -1,5 +1,5 @@
 PREFIX ?= $(HOME)/.local
-SKILLS ?= $(HOME)/.claude/skills
+SKILLS ?= $(HOME)/.agents/skills
 
 .PHONY: build test install uninstall
 

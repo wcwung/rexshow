@@ -18,7 +18,7 @@ func runSkill(args []string) error {
 	}
 	home, _ := os.UserHomeDir()
 	fs := flag.NewFlagSet("skill "+args[0], flag.ContinueOnError)
-	dir := fs.String("dir", filepath.Join(home, ".claude", "skills"), "skills directory")
+	dir := fs.String("dir", filepath.Join(home, ".agents", "skills"), "skills directory")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
